@@ -3,6 +3,9 @@ name: PRTI Enforcement (Combined)
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
+    # ✅ EXCLUDE workflow files from triggering this workflow
+    paths-ignore:
+      - '.github/workflows/**'
   issue_comment:
     types: [created, edited]
 
