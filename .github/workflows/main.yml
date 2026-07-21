@@ -1,16 +1,16 @@
-name: PRTI Enforcement
- 
+name: PRTI Enforcement (Combined)
+
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
   issue_comment:
     types: [created, edited]
- 
+
 permissions:
   pull-requests: write
   issues: write
   statuses: write
- 
+
 jobs:
   prti-check:
     if: >-
@@ -18,81 +18,198 @@ jobs:
       (github.event_name == 'issue_comment' && github.event.issue.pull_request)
     runs-on: ubuntu-latest
     steps:
-      - name: Validate PRTI data, update sticky comment, set commit status
+      - name: Validate PRTI data with smart validation, update sticky comment, set commit status
         uses: actions/github-script@v7
         with:
           script: |
             const MARKER = '<!-- prti-reminder-sticky -->';
             const STATUS_CONTEXT = 'prti-check';
- 
+
             const { owner, repo } = context.repo;
- 
+
             const prNumber = context.eventName === 'issue_comment'
               ? context.payload.issue.number
               : context.payload.pull_request.number;
- 
+
             const { data: pr } = await github.rest.pulls.get({
               owner, repo, pull_number: prNumber
             });
             const headSha = pr.head.sha;
- 
+
             const comments = await github.paginate(
               github.rest.issues.listComments,
               { owner, repo, issue_number: prNumber, per_page: 100 }
             );
- 
+
             const haystack = [
               pr.body || '',
               ...comments
                 .filter(c => !(c.body || '').includes(MARKER))
                 .map(c => c.body || '')
             ].join('\n');
- 
-            const checks = [
-              { label: 'PR Time',    re: /PR\s*Time\s*:\s*(\S.*)?$/im },
-              { label: 'PR Defects', re: /PR\s*Defects\s*:\s*(\S.*)?$/im },
-              { label: 'TI Time',    re: /TI\s*Time\s*:\s*(\S.*)?$/im },
-            ];
- 
-            const missing = [];
-            for (const c of checks) {
-              const m = haystack.match(c.re);
-              const value = m && m[1] ? m[1].trim() : '';
-              if (!value) missing.push(c.label);
+
+            // ============ VALIDATION FUNCTIONS ============
+
+            // Convert time formats to minutes: "1h 30m" → 90, "2.5h" → 150, "90m" → 90
+            function parseTimeToMinutes(timeStr) {
+              if (!timeStr) return null;
+              timeStr = timeStr.trim().toLowerCase();
+              
+              let minutes = 0;
+              
+              // Match hours (e.g., "2h", "2.5h")
+              const hourMatch = timeStr.match(/(\d+\.?\d*)\s*h/);
+              if (hourMatch) {
+                minutes += parseFloat(hourMatch[1]) * 60;
+              }
+              
+              // Match minutes (e.g., "30m")
+              const minMatch = timeStr.match(/(\d+)\s*m(?!in)/);
+              if (minMatch) {
+                minutes += parseInt(minMatch[1]);
+              }
+              
+              return minutes > 0 ? minutes : null;
             }
-            const allProvided = missing.length === 0;
- 
+
+            // Validate and normalize time format
+            function validateAndFormatTime(value) {
+              const minutes = parseTimeToMinutes(value);
+              if (minutes === null) return null;
+              
+              if (minutes < 0 || minutes > 1440) { // Max 24 hours
+                return { valid: false, error: 'Time must be between 0m and 1440m (24h)' };
+              }
+              
+              // Convert back to readable format
+              const hours = Math.floor(minutes / 60);
+              const mins = minutes % 60;
+              
+              if (hours > 0 && mins > 0) {
+                return { valid: true, value: `${hours}h ${mins}m`, minutes };
+              } else if (hours > 0) {
+                return { valid: true, value: `${hours}h`, minutes };
+              } else {
+                return { valid: true, value: `${mins}m`, minutes };
+              }
+            }
+
+            // Validate defects (must be numeric 0-999)
+            function validateDefects(value) {
+              const num = parseInt(value.trim());
+              if (isNaN(num)) {
+                return { valid: false, error: 'Must be a number (e.g., 0, 5, 12)' };
+              }
+              if (num < 0 || num > 999) {
+                return { valid: false, error: 'Must be between 0 and 999' };
+              }
+              return { valid: true, value: num.toString() };
+            }
+
+            // Extract PRTI fields with flexible regex
+            const fieldPatterns = [
+              { label: 'PR Time', key: 'prTime', re: /PR\s*Time\s*:\s*([^\n]*)/im, validator: validateAndFormatTime },
+              { label: 'PR Defects', key: 'prDefects', re: /PR\s*Defects\s*:\s*([^\n]*)/im, validator: validateDefects },
+              { label: 'TI Time', key: 'tiTime', re: /TI\s*Time\s*:\s*([^\n]*)/im, validator: validateAndFormatTime },
+            ];
+
+            const results = {};
+            const errors = [];
+            let allValid = true;
+
+            for (const field of fieldPatterns) {
+              const match = haystack.match(field.re);
+              const rawValue = match && match[1] ? match[1].trim() : '';
+
+              if (!rawValue) {
+                results[field.key] = { found: false, error: 'Missing' };
+                errors.push(`❌ **${field.label}** is missing`);
+                allValid = false;
+              } else {
+                const validation = field.validator(rawValue);
+                if (validation.valid) {
+                  results[field.key] = { 
+                    found: true, 
+                    raw: rawValue,
+                    normalized: validation.value,
+                    minutes: validation.minutes
+                  };
+                } else {
+                  results[field.key] = { found: true, error: validation.error, raw: rawValue };
+                  errors.push(`❌ **${field.label}**: ${validation.error} (got: "${rawValue}")`);
+                  allValid = false;
+                }
+              }
+            }
+
+            // Calculate totals if all valid
+            let totalMinutes = 0;
+            if (allValid) {
+              totalMinutes = (results.prTime.minutes || 0) + (results.tiTime.minutes || 0);
+            }
+
+            // ============ BUILD COMMENT ============
+
             const author = pr.user ? pr.user.login : 'there';
- 
-            // Build status block as an array of lines (no multi-line backticks)
+
+            // Build examples block
+            const examplesLines = [
+              '',
+              '### 📖 Format Examples',
+              '',
+              '**✅ Correct formats:**',
+              '```',
+              'PR Time    : 2h 30m   (or: 150m, 2.5h)',
+              'PR Defects : 3        (must be a number)',
+              'TI Time    : 1h       (or: 60m, 1.0h)',
+              '```',
+              '',
+              '**❌ Common mistakes:**',
+              '| ❌ Wrong | ✅ Correct |',
+              '|---------|----------|',
+              '| `2.30h` | `2h 30m` |',
+              '| `2:30` | `2h 30m` |',
+              '| `three hours` | `3h` |',
+              '| `3 defects` | `3` |',
+              '| `1.5 hours` | `1h 30m` or `1.5h` |'
+            ];
+
+            // Build status block
             let statusLines;
-            if (allProvided) {
+            if (allValid) {
               statusLines = [
-                '### PRTI Checklist Complete',
-                'All required PRTI fields were detected. Thank you!'
+                '### ✅ PRTI Checklist Complete',
+                '',
+                'All required fields are valid! Thank you! 🎉',
+                '',
+                '**Summary:**',
+                `- PR Time: ${results.prTime.normalized}`,
+                `- PR Defects: ${results.prDefects.normalized}`,
+                `- TI Time: ${results.tiTime.normalized}`,
+                `- **Total Effort Time: ${Math.floor(totalMinutes / 60)}h ${totalMinutes % 60}m**`
               ];
             } else {
               statusLines = [
-                '### PRTI Checklist Incomplete',
-                'The following field(s) are missing or empty: **' + missing.join(', ') + '**',
+                '### ❌ PRTI Checklist Incomplete',
                 '',
-                'This PR is **blocked from merging** until the checklist is completed.'
+                'Please fix the following issues:',
+                '',
+                ...errors,
+                ...examplesLines
               ];
             }
- 
-            // Build the full comment body line-by-line, then join with newlines
+
+            // Build the full comment body
             const bodyLines = [
               MARKER,
-              '## PRTI Checklist',
+              '## 📋 PRTI Checklist',
               '',
-              'Hi @' + author + ', please add a **PRTI comment** and fill in the',
-              'checklist below (in the PR description **or** a comment).',
-              'Fill every field with a value:',
+              `Hi @${author}, please add a **PRTI comment** and fill in the checklist below (in the PR description **or** a comment). Fill every field with a value:`,
               '',
               '```',
-              'PR Time    : ',
-              'PR Defects : ',
-              'TI Time    : ',
+              'PR Time    : <!-- e.g., 2h 30m -->',
+              'PR Defects : <!-- e.g., 3 -->',
+              'TI Time    : <!-- e.g., 1h -->',
               '```',
               '',
               '| Field | Meaning |',
@@ -102,12 +219,16 @@ jobs:
               '| **TI Time** | Time spent on Technical Investigation |',
               '',
               '---',
+              '',
               ...statusLines,
               '',
-              '> Automated by the PRTI Enforcement workflow. This comment updates itself in place.'
+              '> ℹ️ Automated by the PRTI Enforcement workflow. This comment updates itself automatically.'
             ];
+
             const body = bodyLines.join('\n');
- 
+
+            // ============ UPSERT STICKY COMMENT ============
+
             const existing = comments.find(c => (c.body || '').includes(MARKER));
             if (existing) {
               await github.rest.issues.updateComment({
@@ -118,23 +239,27 @@ jobs:
                 owner, repo, issue_number: prNumber, body
               });
             }
- 
-            const description = allProvided
-              ? 'PRTI checklist complete'
-              : ('Missing: ' + missing.join(', ')).slice(0, 140);
- 
+
+            // ============ SET COMMIT STATUS ============
+
+            const description = allValid
+              ? `PRTI checklist complete (${Math.floor(totalMinutes / 60)}h ${totalMinutes % 60}m total)`
+              : `Missing/Invalid: ${errors.length} issue(s)`.slice(0, 140);
+
             await github.rest.repos.createCommitStatus({
               owner,
               repo,
               sha: headSha,
               context: STATUS_CONTEXT,
-              state: allProvided ? 'success' : 'failure',
+              state: allValid ? 'success' : 'failure',
               description,
-              target_url: 'https://github.com/' + owner + '/' + repo + '/pull/' + prNumber
+              target_url: `https://github.com/${owner}/${repo}/pull/${prNumber}`
             });
- 
-            if (allProvided) {
-              core.info('PRTI checklist complete - commit status set to success.');
+
+            // ============ LOGGING ============
+
+            if (allValid) {
+              core.info(`✅ PRTI checklist complete. Total effort: ${Math.floor(totalMinutes / 60)}h ${totalMinutes % 60}m`);
             } else {
-              core.warning('PRTI checklist incomplete. Missing: ' + missing.join(', '));
+              core.warning(`❌ PRTI validation failed:\n${errors.join('\n')}`);
             }
