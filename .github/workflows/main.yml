@@ -1,13 +1,12 @@
-name: PRTI Enforcement (Combined)
+name: PRTI Enforcement (Fixed & Improved)
 
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
-    # ✅ EXCLUDE workflow files from triggering this workflow
-    paths-ignore:
-      - '.github/workflows/**'
+    # paths-ignore:
+    #   - '.github/workflows/**'
   issue_comment:
-    types: [created, edited]
+    types: [created, edited, deleted]
 
 permissions:
   pull-requests: write
@@ -21,7 +20,7 @@ jobs:
       (github.event_name == 'issue_comment' && github.event.issue.pull_request)
     runs-on: ubuntu-latest
     steps:
-      - name: Validate PRTI data with smart validation, update sticky comment, set commit status
+      - name: Validate PRTI data with strict validation, update sticky comment, set commit status
         uses: actions/github-script@v7
         with:
           script: |
@@ -44,12 +43,19 @@ jobs:
               { owner, repo, issue_number: prNumber, per_page: 100 }
             );
 
-            const haystack = [
-              pr.body || '',
-              ...comments
-                .filter(c => !(c.body || '').includes(MARKER))
-                .map(c => c.body || '')
-            ].join('\n');
+            // Build haystack from PR body and user comments (excluding bot and sticky comment)
+            const userComments = comments
+              .filter(c => {
+                const body = c.body || '';
+                // Exclude our sticky comment
+                if (body.includes(MARKER)) return false;
+                // Exclude bot comments
+                if (c.user.type === 'Bot') return false;
+                return true;
+              })
+              .map(c => c.body || '');
+
+            const haystack = [pr.body || '', ...userComments].join('\n');
 
             // ============ VALIDATION FUNCTIONS ============
 
@@ -58,18 +64,31 @@ jobs:
               if (!timeStr) return null;
               timeStr = timeStr.trim().toLowerCase();
               
+              // REJECT colon format (e.g., "2:30", "3:45")
+              if (timeStr.includes(':')) {
+                return null;
+              }
+              
               let minutes = 0;
+              let foundAnyMatch = false;
               
               // Match hours (e.g., "2h", "2.5h")
               const hourMatch = timeStr.match(/(\d+\.?\d*)\s*h/);
               if (hourMatch) {
                 minutes += parseFloat(hourMatch[1]) * 60;
+                foundAnyMatch = true;
               }
               
               // Match minutes (e.g., "30m")
               const minMatch = timeStr.match(/(\d+)\s*m(?!in)/);
               if (minMatch) {
                 minutes += parseInt(minMatch[1]);
+                foundAnyMatch = true;
+              }
+              
+              // If we didn't find ANY match, return null (invalid format)
+              if (!foundAnyMatch) {
+                return null;
               }
               
               return minutes > 0 ? minutes : null;
@@ -80,8 +99,8 @@ jobs:
               const minutes = parseTimeToMinutes(value);
               if (minutes === null) return null;
               
-              if (minutes < 0 || minutes > 1440) { // Max 24 hours
-                return { valid: false, error: 'Time must be between 0m and 1440m (24h)' };
+              if (minutes <= 0 || minutes > 1440) { // Max 24 hours
+                return { valid: false, error: 'Time must be between 1m and 1440m (24h)' };
               }
               
               // Convert back to readable format
@@ -130,7 +149,7 @@ jobs:
                 allValid = false;
               } else {
                 const validation = field.validator(rawValue);
-                if (validation.valid) {
+                if (validation && validation.valid) {
                   results[field.key] = { 
                     found: true, 
                     raw: rawValue,
@@ -138,8 +157,10 @@ jobs:
                     minutes: validation.minutes
                   };
                 } else {
-                  results[field.key] = { found: true, error: validation.error, raw: rawValue };
-                  errors.push(`❌ **${field.label}**: ${validation.error} (got: "${rawValue}")`);
+                  // If validation is null or invalid
+                  const errorMsg = validation ? validation.error : 'Invalid format';
+                  results[field.key] = { found: true, error: errorMsg, raw: rawValue };
+                  errors.push(`❌ **${field.label}**: ${errorMsg} (got: "${rawValue}")`);
                   allValid = false;
                 }
               }
@@ -167,9 +188,10 @@ jobs:
               'TI Time    : 1h       (or: 60m, 1.0h)',
               '```',
               '',
-              '**❌ Common mistakes:**',
+              '**❌ Common mistakes (will be rejected):**',
               '| ❌ Wrong | ✅ Correct |',
               '|---------|----------|',
+              '| `3:30` | `3h 30m` |',
               '| `2.30h` | `2h 30m` |',
               '| `2:30` | `2h 30m` |',
               '| `three hours` | `3h` |',
@@ -225,7 +247,7 @@ jobs:
               '',
               ...statusLines,
               '',
-              '> ℹ️ Automated by the PRTI Enforcement workflow. This comment updates itself automatically.'
+              '> ℹ️ Automated by the PRTI Enforcement workflow. This comment updates automatically whenever you push changes or edit comments.'
             ];
 
             const body = bodyLines.join('\n');
